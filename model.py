@@ -4,6 +4,8 @@ import data as DataHelper
 samples, labels = DataHelper.get_train_set()
 test_samples, test_labels = DataHelper.get_test_set()
 vocab_src, vocab_tgt = DataHelper.get_vocabs()
+batch_size = 64
+hidden_size = 100
 
 
 class LSTMcell():
@@ -107,6 +109,10 @@ class EncoderBasic:
         sentence_length = len(batch_of_sentences[0])  # length of a sentence
         for i in range(sentence_length):
             x = batch_of_sentences[:, i]
+            # todo
+            x = [vector[id] for id in x]
+            #map x from ids to vectors
+            ###
             cell_state, hidden_state = self.lstm_cell.run_step(x, cell_state, hidden_state)
             hidden_states.append(hidden_state)
         return hidden_states
@@ -132,7 +138,7 @@ class DecoderBasic:
         sentence_length = len(labels[0])
         logits = []  # model's predictions
         # feed <sos> to generate first word
-        cell_state, hidden_state = self.lstm_cell.run_step([vocab_tgt[DataHelper.sos_id]] * self.lstm_cell.batch_size,
+        cell_state, hidden_state = self.lstm_cell.run_step([vector_sos] * self.lstm_cell.batch_size,
                                                            cell_state, hidden_state)
         score_vector = tf.add(
             tf.matmul(hidden_state, self.weight_score), self.bias_score
@@ -141,7 +147,7 @@ class DecoderBasic:
 
         for i in range(sentence_length - 1): # shift by 1
             x = labels[:, i]
-            x = [self.embeddings[ids] for ids in x]  # transform to batch of vector
+            x = [vectors[id] for id in x]  # transform to batch of vector
             cell_state, hidden_state = self.lstm_cell.run_step(x, cell_state, hidden_state)
             score_vector = tf.add(
                 tf.matmul(hidden_state, self.weight_score), self.bias_score
@@ -149,3 +155,35 @@ class DecoderBasic:
             logits.append(score_vector)
 
         return logits
+
+
+def create_dataset(sentences_as_ids):
+    def generator():
+        for sentence in sentences_as_ids:
+            yield sentence
+    dataset = tf.data.Dataset.from_generator(generator, output_types=tf.int64)
+    return dataset
+
+
+# dataset
+src_set = create_dataset(samples)
+tgt_set = create_dataset(labels)
+train_set = tf.data.Dataset.zip((src_set, tgt_set))
+train_set = train_set.shuffle(10000)
+train_set = train_set.apply(tf.contrib.data.padded_batch_and_drop_remainder(64, ([None], [None])))
+it = train_set.make_initializable_iterator()
+batch_x, batch_y = it.get_next()
+# graph
+encoder = EncoderBasic(LSTMcell(hidden_size, len(vocab_src), batch_size))
+decoder = DecoderBasic(LSTMcell(hidden_size, len(vocab_tgt), batch_size), len(vocab_tgt))
+encode_hidden_states = encoder.encode(batch_x)
+logits = decoder.decode(batch_y, encode_hidden_states[-1])
+loss = tf.reduce_sum(tf.nn.sparse_softmax_cross_entropy_with_logits(labels=batch_y, logits=logits))
+params = tf.trainable_variables()
+gradients = tf.gradients(loss, params)  # derivation of loss by params
+max_gradient_norm = 1.25
+clipped_gradients, _ = tf.clip_by_global_norm(gradients, max_gradient_norm)
+learning_rate = 0.001
+optimizer = tf.train.GradientDescentOptimizer(learning_rate)
+global_step = 0
+optimizer = optimizer.apply_gradients(zip(clipped_gradients, params), global_step=global_step)
