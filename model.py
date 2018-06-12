@@ -22,16 +22,16 @@ class LSTMcell():
         # 'a' of shape[batch_size, hidden_size]
         # 'x' of shape[batch_size, input_size]
         # [a,x] has shape[batch_size, hidden_size + input_size]
-        self.weight_update = tf.truncated_normal(shape=[hidden_size + input_size, hidden_size], seed=1)
-        self.weight_forget = tf.truncated_normal(shape=[hidden_size + input_size, hidden_size], seed=2)
-        self.weight_candidate = tf.truncated_normal(shape=[hidden_size + input_size, hidden_size], seed=3)
-        self.weight_output = tf.truncated_normal(shape=[hidden_size + input_size, hidden_size], seed=4)
+        self.weight_update = tf.Variable(tf.truncated_normal(shape=[hidden_size + input_size, hidden_size], seed=1))
+        self.weight_forget = tf.Variable(tf.truncated_normal(shape=[hidden_size + input_size, hidden_size], seed=2))
+        self.weight_candidate = tf.Variable(tf.truncated_normal(shape=[hidden_size + input_size, hidden_size], seed=3))
+        self.weight_output = tf.Variable(tf.truncated_normal(shape=[hidden_size + input_size, hidden_size], seed=4))
 
-        self.bias_update = tf.truncated_normal(shape=[batch_size, hidden_size], seed=1)
-        self.bias_forget = tf.truncated_normal(shape=[batch_size, hidden_size], seed=2)
-        # self.bias_forget = tf.ones(shape=[batch_size, hidden_size])
-        self.bias_candidate = tf.truncated_normal(shape=[batch_size, hidden_size], seed=3)
-        self.bias_output = tf.truncated_normal(shape=[batch_size, hidden_size], seed=4)
+        self.bias_update = tf.Variable(tf.truncated_normal(shape=[batch_size, hidden_size], seed=1))
+        self.bias_forget = tf.Variable(tf.truncated_normal(shape=[batch_size, hidden_size], seed=2))
+        # self.bias_forget = tf.Variable(tf.ones(shape=[batch_size, hidden_size]))
+        self.bias_candidate = tf.Variable(tf.truncated_normal(shape=[batch_size, hidden_size], seed=3))
+        self.bias_output = tf.Variable(tf.truncated_normal(shape=[batch_size, hidden_size], seed=4))
 
 
     def run_step(self, x, c, a):
@@ -105,24 +105,30 @@ class EncoderBasic:
         """
         cell_state = tf.zeros([self.lstm_cell.batch_size, self.lstm_cell.hidden_size])
         hidden_state = tf.zeros([self.lstm_cell.batch_size, self.lstm_cell.hidden_size])
-        hidden_states = []
-        sentence_length = len(batch_of_sentences[0])  # length of a sentence
-        for i in range(sentence_length):
+        sentence_length = tf.shape(batch_of_sentences)[1]  # length of a sentence
+        hidden_states = tf.TensorArray(tf.float32, size=sentence_length, dynamic_size=True, clear_after_read=False,
+                                       infer_shape=False)
+        def cond(i, *_):
+            return tf.less(i, sentence_length)
+        def body(i, c, hid_states):
             x = batch_of_sentences[:, i]
-            # todo
-            x = [vector[id] for id in x]
-            #map x from ids to vectors
-            ###
-            cell_state, hidden_state = self.lstm_cell.run_step(x, cell_state, hidden_state)
-            hidden_states.append(hidden_state)
-        return hidden_states
+            x = tf.map_fn(lambda e: tf.one_hot(e, len(vocab_src), dtype=tf.float32), x, dtype=tf.float32)
+            if i == 0:
+                c, new_hs = self.lstm_cell.run_step(x, c, hidden_state)
+            else:
+                c, new_hs = self.lstm_cell.run_step(x, c, hid_states.read(i - 1))
+            hid_states = hid_states.write(i, new_hs)
+            return i+1, c, hid_states
+        _, _, hidden_states = tf.while_loop(cond, body, [0, cell_state, hidden_states])
+
+        return hidden_states.stack()
 
 
 class DecoderBasic:
     def __init__(self, lstm_cell, tgt_vocab_size):
         self.lstm_cell = lstm_cell
-        self.weight_score = tf.truncated_normal([lstm_cell.hidden_size, tgt_vocab_size])
-        self.bias_score = tf.zeros([lstm_cell.batch_size, tgt_vocab_size])
+        self.weight_score = tf.Variable(tf.truncated_normal([lstm_cell.hidden_size, tgt_vocab_size]))
+        self.bias_score = tf.Variable(tf.zeros([lstm_cell.batch_size, tgt_vocab_size]))
 
 
     def decode(self, labels, hidden_state):
@@ -135,26 +141,37 @@ class DecoderBasic:
         :return: tuple of (cell_state, logits)
         """
         cell_state = tf.zeros([self.lstm_cell.batch_size, self.lstm_cell.hidden_size])
-        sentence_length = len(labels[0])
-        logits = []  # model's predictions
+        sentence_length = tf.shape(labels)[1]
+        hidden_states = tf.TensorArray(tf.float32, size=sentence_length, dynamic_size=True, clear_after_read=False,
+                                       infer_shape=False)
+        logits = tf.TensorArray(tf.float32, size=sentence_length, dynamic_size=True, clear_after_read=False,
+                                infer_shape=False)  # model's predictions
+        i = 0
         # feed <sos> to generate first word
-        cell_state, hidden_state = self.lstm_cell.run_step([vector_sos] * self.lstm_cell.batch_size,
-                                                           cell_state, hidden_state)
+        cell_state, hidden_state = self.lstm_cell.run_step(
+            [tf.one_hot(DataHelper.sos_id, len(vocab_tgt), dtype=tf.float32)] * self.lstm_cell.batch_size,
+            cell_state, hidden_state)
+        hidden_states = hidden_states.write(i, hidden_state)
         score_vector = tf.add(
             tf.matmul(hidden_state, self.weight_score), self.bias_score
         )
-        logits.append(score_vector)
-
-        for i in range(sentence_length - 1): # shift by 1
-            x = labels[:, i]
-            x = [vectors[id] for id in x]  # transform to batch of vector
-            cell_state, hidden_state = self.lstm_cell.run_step(x, cell_state, hidden_state)
-            score_vector = tf.add(
-                tf.matmul(hidden_state, self.weight_score), self.bias_score
+        logits = logits.write(i, score_vector)
+        def cond(i, *_):
+            return tf.less(i, sentence_length - 1)  # shift left by 1
+        def body(i, c, predicts, hid_states):
+            y = labels[:, i]
+            y = tf.map_fn(lambda e: tf.one_hot(e, len(vocab_tgt), dtype=tf.float32), y, dtype=tf.float32)
+            c, new_hs = self.lstm_cell.run_step(y, c, hid_states.read(i-1))
+            hid_states = hid_states.write(i, new_hs)
+            score = tf.add(
+                tf.matmul(new_hs, self.weight_score), self.bias_score
             )
-            logits.append(score_vector)
+            predicts = predicts.write(i, score)
+            return i+1, c, predicts, hid_states
 
-        return logits
+        _, _, logits, hidden_states = tf.while_loop(cond, body, [i, cell_state, logits, hidden_states])
+
+        return logits.stack(), hidden_states.stack()
 
 
 def create_dataset(sentences_as_ids):
