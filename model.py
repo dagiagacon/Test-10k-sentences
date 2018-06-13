@@ -113,6 +113,7 @@ class EncoderBasic:
         def body(i, c, hid_states):
             x = batch_of_sentences[:, i]
             x = tf.map_fn(lambda e: tf.one_hot(e, len(vocab_src), dtype=tf.float32), x, dtype=tf.float32)
+            # c, new_hs = tf.cond(tf.equal)
             if i == 0:
                 c, new_hs = self.lstm_cell.run_step(x, c, hidden_state)
             else:
@@ -202,5 +203,18 @@ max_gradient_norm = 1.25
 clipped_gradients, _ = tf.clip_by_global_norm(gradients, max_gradient_norm)
 learning_rate = 0.001
 optimizer = tf.train.GradientDescentOptimizer(learning_rate)
-global_step = 0
+global_step = tf.Variable(0, trainable=False)
 optimizer = optimizer.apply_gradients(zip(clipped_gradients, params), global_step=global_step)
+# train
+log_frequency = 1000
+with tf.Session() as sess:
+    global_step.assign(0)
+    sess.run(tf.global_variables_initializer())
+    try:
+        sess.run(it.initializer)
+        while True:
+            _, l = sess.run([optimizer, loss])
+            if global_step % log_frequency == 0:
+               print('Step {}: loss={}'.format(global_step % log_frequency, l))
+    except tf.errors.OutOfRangeError:
+        exit(2)
